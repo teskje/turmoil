@@ -821,7 +821,7 @@ fn peek_empty_buffer() -> Result {
     });
 
     sim.client("client", async move {
-        let mut s = TcpStream::connect(("server", PORT)).await?;
+        let s = TcpStream::connect(("server", PORT)).await?;
 
         // no-op peek with empty buffer
         let mut buf = [0; 0];
@@ -1485,7 +1485,7 @@ fn ready_readable() -> Result {
     });
 
     sim.client("client", async move {
-        let mut s = TcpStream::connect(("server", PORT)).await?;
+        let s = TcpStream::connect(("server", PORT)).await?;
         let ready = s.ready(Interest::READABLE).await?;
         assert_eq!(ready, Ready::READABLE);
         Ok(())
@@ -1505,7 +1505,7 @@ fn ready_writable() -> Result {
     });
 
     sim.client("client", async move {
-        let mut s = TcpStream::connect(("server", PORT)).await?;
+        let s = TcpStream::connect(("server", PORT)).await?;
         let ready = s.ready(Interest::WRITABLE).await?;
         assert_eq!(ready, Ready::WRITABLE);
         Ok(())
@@ -1548,7 +1548,7 @@ fn ready_read_closed_on_fin() -> Result {
     });
 
     sim.client("client", async move {
-        let mut s = TcpStream::connect(("server", PORT)).await?;
+        let s = TcpStream::connect(("server", PORT)).await?;
         let ready = s.ready(Interest::READABLE).await?;
         assert_eq!(ready, Ready::READ_CLOSED);
         Ok(())
@@ -1569,7 +1569,7 @@ fn ready_read_closed_on_rst() -> Result {
     });
 
     sim.client("client", async move {
-        let mut s = TcpStream::connect(("server", PORT)).await?;
+        let s = TcpStream::connect(("server", PORT)).await?;
         let ready = s.ready(Interest::READABLE).await?;
         assert_eq!(ready, Ready::READ_CLOSED);
         Ok(())
