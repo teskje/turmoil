@@ -1,15 +1,18 @@
 use bytes::{Buf, Bytes};
-use std::future::poll_fn;
+use std::future::{pending, poll_fn};
 use std::{
     fmt::Debug,
     io::{self, Error, Result},
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     task::{ready, Context, Poll},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite, Interest, ReadBuf, Ready},
     runtime::Handle,
     sync::{mpsc, oneshot},
     time::sleep,
@@ -40,11 +43,11 @@ impl TcpStream {
         let pair = Arc::new(pair);
         let read_half = ReadHalf {
             pair: pair.clone(),
-            rx: Rx {
+            rx: Mutex::new(Rx {
                 recv: receiver,
                 buffer: None,
-            },
-            is_closed: false,
+            }),
+            is_closed: AtomicBool::new(false),
         };
 
         let write_half = WriteHalf {
@@ -127,6 +130,47 @@ impl TcpStream {
         }
     }
 
+    /// Waits for any of the requested ready states.
+    pub async fn ready(&self, interest: Interest) -> Result<Ready> {
+        // Hang indefinitely on unsupported interests, mimicking tokio's behavior.
+        if !interest.is_readable() && !interest.is_writable() {
+            return pending().await;
+        }
+
+        let mut buf = [0];
+        let mut buf = ReadBuf::new(&mut buf);
+
+        poll_fn(|cx| {
+            let mut ready = Ready::EMPTY;
+
+            if interest.is_writable() {
+                if self.write_half.is_shutdown {
+                    ready |= Ready::WRITE_CLOSED;
+                } else {
+                    ready |= Ready::WRITABLE;
+                }
+            }
+
+            if interest.is_readable() {
+                if self.read_half.is_closed.load(Ordering::Acquire) {
+                    ready |= Ready::READ_CLOSED;
+                } else if let Poll::Ready(result) = self.poll_peek(cx, &mut buf) {
+                    ready |= match result {
+                        Ok(1) => Ready::READABLE,
+                        _ => Ready::READ_CLOSED,
+                    };
+                }
+            }
+
+            if ready.is_empty() {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(ready))
+            }
+        })
+        .await
+    }
+
     /// Waits for the socket to become writable.
     ///
     /// This function is equivalent to `ready(Interest::WRITABLE)` and is usually
@@ -171,23 +215,23 @@ impl TcpStream {
     /// returns the number of bytes peeked.
     ///
     /// Successive calls return the same data.
-    pub async fn peek(&mut self, buf: &mut [u8]) -> Result<usize> {
+    pub async fn peek(&self, buf: &mut [u8]) -> Result<usize> {
         self.read_half.peek(buf).await
     }
 
     /// Attempts to receive data on the socket, without removing that data from
     /// the queue, registering the current task for wakeup if data is not yet
     /// available.
-    pub fn poll_peek(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf) -> Poll<Result<usize>> {
+    pub fn poll_peek(&self, cx: &mut Context<'_>, buf: &mut ReadBuf) -> Poll<Result<usize>> {
         self.read_half.poll_peek(cx, buf)
     }
 }
 
 pub(crate) struct ReadHalf {
     pub(crate) pair: Arc<SocketPair>,
-    rx: Rx,
+    rx: Mutex<Rx>,
     /// FIN received, EOF for reads
-    is_closed: bool,
+    is_closed: AtomicBool,
 }
 
 struct Rx {
@@ -200,27 +244,33 @@ struct Rx {
 }
 
 impl ReadHalf {
-    fn poll_read_priv(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf) -> Poll<Result<()>> {
-        if self.is_closed || buf.capacity() == 0 {
+    fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::Acquire)
+    }
+
+    fn poll_read_priv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf) -> Poll<Result<()>> {
+        if self.is_closed() || buf.capacity() == 0 {
             return Poll::Ready(Ok(()));
         }
 
-        if let Some(bytes) = self.rx.buffer.take() {
-            self.rx.buffer = Self::put_slice(bytes, buf);
+        let mut rx = self.rx.lock().unwrap();
+
+        if let Some(bytes) = rx.buffer.take() {
+            rx.buffer = Self::put_slice(bytes, buf);
 
             return Poll::Ready(Ok(()));
         }
 
-        match ready!(self.rx.recv.poll_recv(cx)) {
+        match ready!(rx.recv.poll_recv(cx)) {
             Some(seg) => {
                 tracing::trace!(target: TRACING_TARGET, src = ?self.pair.remote, dst = ?self.pair.local, protocol = %seg, "Recv");
 
                 match seg {
                     SequencedSegment::Data(bytes) => {
-                        self.rx.buffer = Self::put_slice(bytes, buf);
+                        rx.buffer = Self::put_slice(bytes, buf);
                     }
                     SequencedSegment::Fin => {
-                        self.is_closed = true;
+                        self.is_closed.store(true, Ordering::Release);
                     }
                 }
 
@@ -251,23 +301,21 @@ impl ReadHalf {
         }
     }
 
-    pub(crate) fn poll_peek(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf,
-    ) -> Poll<Result<usize>> {
-        if self.is_closed || buf.capacity() == 0 {
+    pub(crate) fn poll_peek(&self, cx: &mut Context<'_>, buf: &mut ReadBuf) -> Poll<Result<usize>> {
+        if self.is_closed() || buf.capacity() == 0 {
             return Poll::Ready(Ok(0));
         }
 
+        let mut rx = self.rx.lock().unwrap();
+
         // If we have buffered data, peek from it
-        if let Some(bytes) = &self.rx.buffer {
+        if let Some(bytes) = &rx.buffer {
             let len = std::cmp::min(bytes.len(), buf.remaining());
             buf.put_slice(&bytes[..len]);
             return Poll::Ready(Ok(len));
         }
 
-        match ready!(self.rx.recv.poll_recv(cx)) {
+        match ready!(rx.recv.poll_recv(cx)) {
             Some(seg) => {
                 tracing::trace!(target: TRACING_TARGET, src = ?self.pair.remote, dst = ?self.pair.local, protocol = %seg, "Peek");
 
@@ -275,12 +323,12 @@ impl ReadHalf {
                     SequencedSegment::Data(bytes) => {
                         let len = std::cmp::min(bytes.len(), buf.remaining());
                         buf.put_slice(&bytes[..len]);
-                        self.rx.buffer = Some(bytes);
+                        rx.buffer = Some(bytes);
 
                         Poll::Ready(Ok(len))
                     }
                     SequencedSegment::Fin => {
-                        self.is_closed = true;
+                        self.is_closed.store(true, Ordering::Release);
                         Poll::Ready(Ok(0))
                     }
                 }
@@ -292,7 +340,7 @@ impl ReadHalf {
         }
     }
 
-    pub(crate) async fn peek(&mut self, buf: &mut [u8]) -> Result<usize> {
+    pub(crate) async fn peek(&self, buf: &mut [u8]) -> Result<usize> {
         let mut buf = ReadBuf::new(buf);
         poll_fn(|cx| self.poll_peek(cx, &mut buf)).await
     }
@@ -302,7 +350,7 @@ impl Debug for ReadHalf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadHalf")
             .field("pair", &self.pair)
-            .field("is_closed", &self.is_closed)
+            .field("is_closed", &self.is_closed())
             .finish()
     }
 }
@@ -422,7 +470,7 @@ impl Debug for WriteHalf {
 
 impl AsyncRead for ReadHalf {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf,
     ) -> Poll<Result<()>> {
